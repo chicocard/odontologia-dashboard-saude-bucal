@@ -1,10 +1,14 @@
-
+﻿
 from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+import json
+import math
 import re
+
+import plotly.graph_objects as go
 
 import duckdb
 import pandas as pd
@@ -18,46 +22,25 @@ import streamlit as st
 
 APP_DIR = Path(__file__).resolve().parent
 ROOT_DIR = APP_DIR.parent
-DB_PATH = Path(r"C:\rais-intelligence-data\database\odontologia_workforce.duckdb")
-TABLE = "odontologia_saude_bucal_vinculos"
+DB_PATH = Path(__file__).resolve().parent / "data" / "database" / "odontologia_workforce.duckdb"
+TABLE = "odontologia_vinculos"
 
-BASE_TABLE = "odontologia_vinculos"
-
-
-def ensure_saude_bucal_view():
-    """
-    Cria/atualiza uma view estrita de Saúde Bucal a partir da tabela geral.
-    O painel principal usa apenas CD, TSB, ASB, TPD e APD.
-    """
-    if not DB_PATH.exists():
-        return
-
-    con = duckdb.connect(str(DB_PATH))
-    try:
-        tables = con.execute("SHOW TABLES").fetchdf()["name"].astype(str).tolist()
-        if BASE_TABLE not in tables:
-            return
-
-        con.execute(f"""
-            CREATE OR REPLACE VIEW {TABLE} AS
-            SELECT *
-            FROM {BASE_TABLE}
-            WHERE
-                REGEXP_REPLACE(CAST(cbo AS VARCHAR), '[^0-9]', '', 'g') LIKE '2232%'
-                OR REGEXP_REPLACE(CAST(cbo AS VARCHAR), '[^0-9]', '', 'g') IN (
-                    '322405',
-                    '322410',
-                    '322415',
-                    '322420',
-                    '322425',
-                    '322430'
-                )
-        """)
-    finally:
-        con.close()
-
-
-ensure_saude_bucal_view()
+# Filtro estrito de Saúde Bucal aplicado em todas as consultas.
+# Evita criar VIEW dentro do Streamlit e impede conflito de conexão DuckDB
+# entre conexões read_only=True e conexões de escrita.
+ORAL_HEALTH_CBO_FILTER = """
+(
+    REGEXP_REPLACE(CAST(cbo AS VARCHAR), '[^0-9]', '', 'g') LIKE '2232%'
+    OR REGEXP_REPLACE(CAST(cbo AS VARCHAR), '[^0-9]', '', 'g') IN (
+        '322405',
+        '322410',
+        '322415',
+        '322420',
+        '322425',
+        '322430'
+    )
+)
+"""
 
 
 REFERENCE_DIRS = [
@@ -66,12 +49,21 @@ REFERENCE_DIRS = [
     APP_DIR,
 ]
 
+ASSET_DIRS = [
+    APP_DIR / "assets",
+    ROOT_DIR / "assets",
+    APP_DIR,
+    ROOT_DIR,
+]
+
 TERRITORY_NAMES = ["tabela_regioes(1).csv", "tabela_regioes.csv"]
 POP_NAMES = ["populacao_tcu_municipios.csv", "populacao_municipios.csv"]
 CBO_MAP_NAMES = ["cbo_odontologia_mapa.csv", "cbo_mapa.csv"]
+UF_GEOJSON_NAMES = ["br_ufs.geojson", "br_uf.geojson", "ufs.geojson", "uf.geojson"]
+MUNICIPIO_GEOJSON_NAMES = ["br_municipios.geojson", "municipios.geojson", "br_municipios.json"]
 
 st.set_page_config(
-    page_title="OdontoWorkforce Brasil — V5.7 Saúde Bucal",
+    page_title="OdontoWorkforce Brasil — V6.5 Saúde Bucal",
     page_icon="🦷",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -284,6 +276,303 @@ def find_reference_file(names: list[str]) -> Path | None:
             if p.exists():
                 return p
     return None
+
+
+def find_asset_file(names: list[str]) -> Path | None:
+    # Busca direta nos locais esperados.
+    for refdir in ASSET_DIRS:
+        for name in names:
+            p = refdir / name
+            if p.exists():
+                return p
+
+    # Busca recursiva para cobrir o caso comum de ZIP extraído dentro de uma subpasta.
+    search_roots = [APP_DIR, ROOT_DIR]
+    seen = set()
+    for root in search_roots:
+        try:
+            root_resolved = root.resolve()
+        except Exception:
+            root_resolved = root
+        if str(root_resolved) in seen or not root.exists():
+            continue
+        seen.add(str(root_resolved))
+        for name in names:
+            hits = list(root.rglob(name))
+            if hits:
+                # Prefere arquivos dentro de assets quando houver.
+                hits_sorted = sorted(
+                    hits,
+                    key=lambda p: (0 if "assets" in [part.lower() for part in p.parts] else 1, len(str(p)))
+                )
+                return hits_sorted[0]
+    return None
+
+
+def guess_geojson_property(props: dict[str, Any], kind: str) -> str | None:
+    keys = list(props.keys())
+    lower_map = {str(k).lower(): k for k in keys}
+
+    if kind == "uf":
+        candidates = [
+            "sigla_uf", "sg_uf", "uf", "sigla", "abbr", "codigo_uf", "cd_uf", "id"
+        ]
+    else:
+        candidates = [
+            "cod_municipio", "codigo_municipio", "cod_mun", "cd_mun", "cd_geocmu",
+            "geocodigo", "geocodig", "id", "codigo", "codarea"
+        ]
+
+    for cand in candidates:
+        if cand in keys:
+            return cand
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+
+    # fallback heurístico
+    for k in keys:
+        val = props.get(k)
+        sval = str(val).strip()
+        if kind == "uf" and len(sval) == 2 and sval.isalpha():
+            return k
+        if kind == "municipio":
+            dig = re.sub(r"[^0-9]", "", sval)
+            if len(dig) in (6, 7):
+                return k
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def load_geojson(kind: str) -> tuple[dict[str, Any] | None, str]:
+    if kind == "uf":
+        path = find_asset_file(UF_GEOJSON_NAMES)
+    else:
+        path = find_asset_file(MUNICIPIO_GEOJSON_NAMES)
+
+    if path is None:
+        return None, ""
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, str(path)
+
+    feats = data.get("features", [])
+    if not feats:
+        return None, str(path)
+
+    sample_props = feats[0].get("properties", {}) or {}
+    prop = guess_geojson_property(sample_props, kind)
+
+    for feat in feats:
+        props = feat.setdefault("properties", {})
+        raw = props.get(prop) if prop else feat.get("id", "")
+        if kind == "uf":
+            match = str(raw).strip().upper()
+            # Se a propriedade detectada for código numérico de UF, tenta usar a sigla.
+            if match.isdigit() and len(match) == 2:
+                uf_map = {
+                    "11": "RO", "12": "AC", "13": "AM", "14": "RR", "15": "PA", "16": "AP", "17": "TO",
+                    "21": "MA", "22": "PI", "23": "CE", "24": "RN", "25": "PB", "26": "PE", "27": "AL", "28": "SE", "29": "BA",
+                    "31": "MG", "32": "ES", "33": "RJ", "35": "SP",
+                    "41": "PR", "42": "SC", "43": "RS",
+                    "50": "MS", "51": "MT", "52": "GO", "53": "DF",
+                }
+                match = uf_map.get(match, match)
+        else:
+            match = normalize_municipio_code_py(raw)
+
+        # Propriedade padrão, sem underline, para evitar ambiguidades no Plotly.
+        props["match_id"] = match
+
+    return data, str(path)
+
+
+def polygon_rings_from_geometry(geometry: dict[str, Any]) -> list[list[list[float]]]:
+    """
+    Extrai apenas anéis externos de Polygon/MultiPolygon.
+    Evita buracos e geometrias complexas para manter o mapa legível no painel.
+    """
+    if not geometry:
+        return []
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates", [])
+
+    if gtype == "Polygon":
+        return [coords[0]] if coords else []
+
+    if gtype == "MultiPolygon":
+        rings = []
+        for poly in coords:
+            if poly:
+                rings.append(poly[0])
+        return rings
+
+    if gtype == "GeometryCollection":
+        rings = []
+        for geom in geometry.get("geometries", []):
+            rings.extend(polygon_rings_from_geometry(geom))
+        return rings
+
+    return []
+
+
+def simplify_ring_for_plot(ring: list[list[float]], max_points: int = 900) -> list[list[float]]:
+    if len(ring) <= max_points:
+        return ring
+    step = max(1, int(math.ceil(len(ring) / max_points)))
+    out = ring[::step]
+    if out and out[0] != out[-1]:
+        out.append(out[0])
+    return out
+
+
+def color_from_scale(value: float, vmin: float, vmax: float, colorscale: str = "YlOrRd") -> str:
+    if vmax <= vmin:
+        t = 0.5
+    else:
+        t = (float(value) - vmin) / (vmax - vmin)
+        t = max(0.0, min(1.0, t))
+    try:
+        return px.colors.sample_colorscale(colorscale, [t])[0]
+    except Exception:
+        return px.colors.sample_colorscale("YlOrRd", [t])[0]
+
+
+def make_polygon_choropleth(
+    geojson_obj: dict[str, Any],
+    df: pd.DataFrame,
+    loc_col: str,
+    value_col: str,
+    title: str,
+    legend_label: str,
+    *,
+    colorscale: str = "YlOrRd",
+    max_ring_points: int = 700,
+):
+    """
+    Mapa coroplético por polígonos desenhados diretamente com Plotly Scatter.
+    Não usa px.choropleth e não depende de matplotlib/geopandas.
+    """
+    if df.empty or geojson_obj is None:
+        return None
+
+    data_map = df.copy()
+    data_map[loc_col] = data_map[loc_col].astype(str)
+    row_by_id = data_map.set_index(loc_col).to_dict(orient="index")
+
+    values = pd.to_numeric(data_map[value_col], errors="coerce").dropna()
+    if values.empty:
+        vmin, vmax = 0.0, 1.0
+    else:
+        vmin = float(values.min())
+        vmax = float(values.max())
+        if vmin == vmax:
+            vmax = vmin + 1.0
+
+    fig = go.Figure()
+    xs_all: list[float] = []
+    ys_all: list[float] = []
+    matched_polygons = 0
+
+    for feat in geojson_obj.get("features", []):
+        props = feat.get("properties", {}) or {}
+        match_id = str(props.get("match_id", "")).strip()
+        if match_id not in row_by_id:
+            continue
+
+        row = row_by_id[match_id]
+        value = row.get(value_col)
+        if value is None or pd.isna(value):
+            continue
+
+        color = color_from_scale(float(value), vmin, vmax, colorscale)
+
+        territorio = row.get("territorio", match_id)
+        vinculos = row.get("vinculos", None)
+        populacao = row.get("populacao", None)
+        taxa = row.get("taxa_10000", None)
+
+        hover = f"<b>{territorio}</b><br>{legend_label}: {float(value):,.2f}<br>"
+        if vinculos is not None and pd.notna(vinculos):
+            hover += f"Vínculos: {float(vinculos):,.0f}<br>"
+        if populacao is not None and pd.notna(populacao):
+            hover += f"População: {float(populacao):,.0f}<br>"
+        if taxa is not None and pd.notna(taxa):
+            hover += f"Taxa/10 mil: {float(taxa):,.2f}<br>"
+
+        geom = feat.get("geometry", {})
+        for ring in polygon_rings_from_geometry(geom):
+            ring = simplify_ring_for_plot(ring, max_points=max_ring_points)
+            coords = [(float(x), float(y)) for x, y in ring if x is not None and y is not None]
+            if len(coords) < 3:
+                continue
+
+            x_vals = [c[0] for c in coords]
+            y_vals = [c[1] for c in coords]
+            xs_all.extend(x_vals)
+            ys_all.extend(y_vals)
+            matched_polygons += 1
+
+            fig.add_trace(
+                go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode="lines",
+                    fill="toself",
+                    fillcolor=color,
+                    line=dict(color="rgba(30,41,59,0.35)", width=0.35),
+                    hoverinfo="text",
+                    text=hover,
+                    showlegend=False,
+                )
+            )
+
+    if matched_polygons == 0 or not xs_all or not ys_all:
+        return None
+
+    # Traço invisível só para colorbar contínua.
+    fig.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            mode="markers",
+            marker=dict(
+                color=[vmin, vmax],
+                colorscale=colorscale,
+                cmin=vmin,
+                cmax=vmax,
+                showscale=True,
+                colorbar=dict(
+                    title=dict(text=legend_label, side="right"),
+                    thickness=16,
+                    len=0.72,
+                    x=1.02,
+                    y=0.50,
+                ),
+            ),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+    xmin, xmax = min(xs_all), max(xs_all)
+    ymin, ymax = min(ys_all), max(ys_all)
+    pad_x = max((xmax - xmin) * 0.04, 0.25)
+    pad_y = max((ymax - ymin) * 0.04, 0.25)
+
+    fig.update_layout(
+        title=dict(text=title, x=0.01, y=0.98, xanchor="left", yanchor="top", font=dict(size=18)),
+        height=760,
+        margin=dict(l=10, r=130, t=95, b=25),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showlegend=False,
+    )
+    fig.update_xaxes(visible=False, range=[xmin - pad_x, xmax + pad_x], constrain="domain")
+    fig.update_yaxes(visible=False, range=[ymin - pad_y, ymax + pad_y], scaleanchor="x", scaleratio=1)
+
+    return fig
 
 
 def pick(cols: list[str], candidates: list[str]) -> str | None:
@@ -831,7 +1120,7 @@ st.markdown(
     <div class="ow-hero">
         <div class="ow-hero-title">OdontoWorkforce Brasil</div>
         <div class="ow-hero-subtitle">
-            Painel V5.7 Saúde Bucal — composição ocupacional, densidades, território, vínculos e perfil sociodemográfico.
+            Painel V6.5 Saúde Bucal — composição ocupacional, densidades, território, vínculos e perfil sociodemográfico.
         </div>
         <div class="ow-chip-row">
             <span class="ow-chip">RAIS</span>
@@ -898,7 +1187,10 @@ with st.sidebar.expander("1. Período", expanded=True):
     )
     selected_years = list(range(ano_ini, ano_fim + 1))
 
-where_parts = [f"CAST({q(ano_col)} AS INTEGER) BETWEEN {ano_ini} AND {ano_fim}"]
+where_parts = [
+    f"CAST({q(ano_col)} AS INTEGER) BETWEEN {ano_ini} AND {ano_fim}",
+    ORAL_HEALTH_CBO_FILTER,
+]
 
 territory_filtered = territory.copy() if territory is not None else None
 
@@ -1779,82 +2071,446 @@ with tabs[1]:
 
 
 with tabs[2]:
-    st.markdown('<div class="ow-section-title">Território: regiões e macrorregiões de saúde</div>', unsafe_allow_html=True)
+    st.markdown('<div class="ow-section-title">Território: distribuição, dispersão e mapas</div>', unsafe_allow_html=True)
 
-    if municipal_panel.empty:
-        st.warning("A visão territorial exige a tabela de regiões.")
+    st.markdown(
+        '<div class="ow-note">'
+        'A aba Território foi reorganizada para facilitar a leitura da distribuição territorial. '
+        'Os gráficos de distribuição agora podem ser desenhados como violino suave com caixa interna, '
+        'reduzindo a confusão visual dos boxplots tradicionais. A aba também inclui mapas coropléticos das '
+        'taxas per capita e da distribuição espacial dos vínculos.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    if municipal_panel.empty or boletim_panel.empty:
+        st.warning("A visão territorial exige tabela de regiões, população municipal e dados por categoria ocupacional.")
     else:
-        region = (
-            municipal_panel.groupby(["ano", "sg_uf", "regiao_de_saude"], as_index=False)
-            .agg(
-                vinculos=("vinculos", "sum"),
-                populacao=("populacao_usada", "sum"),
-                municipios=("cod_municipio", "nunique"),
-                mediana_municipal=("taxa_municipal", "median"),
-            )
-        )
-        region["taxa_regional"] = region["vinculos"] / region["populacao"] * tax_base
+        categoria_options = ["Total Saúde Bucal", "CD", "TSB", "ASB", "TPD", "APD", "Outras"]
 
-        macro = (
-            municipal_panel.groupby(["ano", "sg_uf", "macrorregiao_de_saude"], as_index=False)
-            .agg(
-                vinculos=("vinculos", "sum"),
-                populacao=("populacao_usada", "sum"),
-                municipios=("cod_municipio", "nunique"),
-                mediana_municipal=("taxa_municipal", "median"),
-            )
-        )
-        macro["taxa_macro"] = macro["vinculos"] / macro["populacao"] * tax_base
+        csel1, csel2, csel3, csel4 = st.columns([1.15, 1.1, 0.9, 0.85])
 
-        c1, c2 = st.columns(2)
-
-        with c1:
-            fig = px.box(
-                region,
-                x="ano",
-                y="taxa_regional",
-                points="all",
-                title=f"Distribuição entre regiões de saúde — {tax_label}",
-                labels={"taxa_regional": tax_label, "ano": "Ano"},
+        with csel1:
+            nivel_territorial = st.selectbox(
+                "Nível territorial",
+                ["UF", "Macrorregião de saúde", "Região de saúde", "Município"],
+                index=1,
             )
+
+        with csel2:
+            categoria_territorio = st.selectbox(
+                "Categoria ocupacional",
+                categoria_options,
+                index=0,
+                format_func=lambda x: CATEGORIA_SB_NOMES.get(x, x),
+            )
+
+        with csel3:
+            anos_territorio = sorted(municipal_panel["ano"].dropna().astype(int).unique().tolist())
+            ano_territorio = st.selectbox(
+                "Ano de destaque",
+                anos_territorio,
+                index=len(anos_territorio) - 1,
+            )
+
+        with csel4:
+            limite_ranking = st.slider("Itens no ranking", 10, 80, 30, step=5)
+
+        def build_territory_summary(level: str, categoria: str) -> pd.DataFrame:
+            if level == "UF":
+                keys = ["ano", "sg_uf"]
+                pop = municipal_panel.groupby(keys, as_index=False).agg(populacao=("populacao_usada", "sum"))
+                pop["territorio"] = pop["sg_uf"]
+            elif level == "Macrorregião de saúde":
+                keys = ["ano", "sg_uf", "macrorregiao_de_saude"]
+                pop = municipal_panel.groupby(keys, as_index=False).agg(populacao=("populacao_usada", "sum"))
+                pop["territorio"] = pop["sg_uf"].astype(str) + " — " + pop["macrorregiao_de_saude"].astype(str)
+            elif level == "Região de saúde":
+                keys = ["ano", "sg_uf", "regiao_de_saude"]
+                pop = municipal_panel.groupby(keys, as_index=False).agg(populacao=("populacao_usada", "sum"))
+                pop["territorio"] = pop["sg_uf"].astype(str) + " — " + pop["regiao_de_saude"].astype(str)
+            else:
+                keys = ["ano", "cod_municipio", "municipio_label", "sg_uf"]
+                pop = municipal_panel.groupby(keys, as_index=False).agg(populacao=("populacao_usada", "max"))
+                pop["territorio"] = pop["municipio_label"].astype(str)
+
+            if categoria == "Total Saúde Bucal":
+                work = boletim_panel.groupby(keys, as_index=False).agg(vinculos=("vinculos", "sum"))
+            else:
+                work = (
+                    boletim_panel[boletim_panel["categoria_sb"] == categoria]
+                    .groupby(keys, as_index=False)
+                    .agg(vinculos=("vinculos", "sum"))
+                )
+
+            out = pop.merge(work, on=keys, how="left")
+            out["vinculos"] = out["vinculos"].fillna(0)
+            out["taxa_10000"] = out["vinculos"] / out["populacao"].replace(0, pd.NA) * 10000
+            out["nivel_territorial"] = level
+            out["categoria"] = categoria
+            return out
+
+        terr_df = build_territory_summary(nivel_territorial, categoria_territorio)
+
+        if terr_df.empty:
+            st.warning("Sem dados territoriais para os filtros atuais.")
+        else:
+            ref = terr_df[terr_df["ano"] == ano_territorio].copy()
+
+            taxa_valid = ref["taxa_10000"].dropna()
+            if taxa_valid.empty:
+                mediana = p25 = p75 = p90 = p10 = pd.NA
+                razao_p90_p10 = pd.NA
+            else:
+                mediana = taxa_valid.median()
+                p25 = taxa_valid.quantile(0.25)
+                p75 = taxa_valid.quantile(0.75)
+                p90 = taxa_valid.quantile(0.90)
+                p10 = taxa_valid.quantile(0.10)
+                razao_p90_p10 = p90 / p10 if pd.notna(p10) and p10 > 0 else pd.NA
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Territórios", fmt_int(ref["territorio"].nunique()))
+            m2.metric("Mediana / 10 mil", fmt_float(mediana, 2) if pd.notna(mediana) else "—")
+            m3.metric("P25–P75", f"{fmt_float(p25, 2)}–{fmt_float(p75, 2)}" if pd.notna(p25) and pd.notna(p75) else "—")
+            m4.metric("P90/P10", fmt_float(razao_p90_p10, 2) if pd.notna(razao_p90_p10) else "—")
+            m5.metric("Vínculos", fmt_int(ref["vinculos"].sum()))
+
+            st.markdown("### Distribuição territorial por ano")
+
+            b1, b2, b3, b4 = st.columns([1.25, 1.0, 1.0, 1.0])
+
+            with b1:
+                estilo_distrib = st.selectbox(
+                    "Desenho da distribuição",
+                    ["Violino suave + caixa", "Box plot clássico"],
+                    index=0,
+                    help="O violino mostra a densidade da distribuição e inclui uma caixa interna com quartis e mediana.",
+                )
+
+            with b2:
+                mostrar_pontos = st.toggle(
+                    "Mostrar pontos",
+                    value=False,
+                    help="Ligue para visualizar cada território individualmente.",
+                )
+
+            with b3:
+                escala_box = st.selectbox(
+                    "Escala",
+                    ["Normal", "Zoom até P95", "Zoom até P99", "Logarítmica"],
+                    index=1,
+                )
+
+            with b4:
+                suavizar_cauda = st.toggle(
+                    "Ocultar extremos altos",
+                    value=False,
+                    help="Aplica um recorte visual até o percentil 99, útil quando poucos extremos dominam a escala.",
+                )
+
+            plot_box = terr_df.copy()
+            ymax = None
+            if escala_box == "Zoom até P95":
+                ymax = plot_box["taxa_10000"].quantile(0.95)
+            elif escala_box == "Zoom até P99":
+                ymax = plot_box["taxa_10000"].quantile(0.99)
+            if suavizar_cauda:
+                ymax_aux = plot_box["taxa_10000"].quantile(0.99)
+                ymax = min(ymax, ymax_aux) if ymax is not None else ymax_aux
+
+            points_mode = "all" if mostrar_pontos else False
+
+            if estilo_distrib == "Violino suave + caixa":
+                fig = px.violin(
+                    plot_box,
+                    x="ano",
+                    y="taxa_10000",
+                    box=True,
+                    points=points_mode,
+                    hover_data={
+                        "territorio": True,
+                        "vinculos": ":,.0f",
+                        "populacao": ":,.0f",
+                        "taxa_10000": ":.2f",
+                        "ano": True,
+                    },
+                    title=(
+                        f"Distribuição territorial — {CATEGORIA_SB_NOMES.get(categoria_territorio, categoria_territorio)} "
+                        f"em {nivel_territorial.lower()}"
+                    ),
+                    labels={
+                        "ano": "Ano",
+                        "taxa_10000": "Vínculos por 10 mil habitantes",
+                    },
+                )
+                fig.update_traces(meanline_visible=True, jitter=0.04)
+            else:
+                fig = px.box(
+                    plot_box,
+                    x="ano",
+                    y="taxa_10000",
+                    points=points_mode,
+                    hover_data={
+                        "territorio": True,
+                        "vinculos": ":,.0f",
+                        "populacao": ":,.0f",
+                        "taxa_10000": ":.2f",
+                        "ano": True,
+                    },
+                    title=(
+                        f"Distribuição territorial — {CATEGORIA_SB_NOMES.get(categoria_territorio, categoria_territorio)} "
+                        f"em {nivel_territorial.lower()}"
+                    ),
+                    labels={
+                        "ano": "Ano",
+                        "taxa_10000": "Vínculos por 10 mil habitantes",
+                    },
+                )
+                fig.update_traces(boxmean=True, jitter=0.25)
+
             fig.update_xaxes(type="category")
+            if escala_box == "Logarítmica":
+                fig.update_yaxes(type="log")
+            elif ymax is not None and pd.notna(ymax) and ymax > 0:
+                fig.update_yaxes(range=[0, ymax * 1.08])
+            fig.update_layout(height=560, showlegend=False)
             plot(fig)
 
-        with c2:
-            fig = px.box(
-                macro,
-                x="ano",
-                y="taxa_macro",
-                points="all",
-                title=f"Distribuição entre macrorregiões — {tax_label}",
-                labels={"taxa_macro": tax_label, "ano": "Ano"},
+            st.markdown(
+                '<div class="ow-small">'
+                'Leitura sugerida: o violino mostra a concentração da distribuição; a caixa interna resume mediana e quartis. '
+                'Use o ranking e os mapas abaixo para entender quais territórios explicam os extremos.'
+                '</div>',
+                unsafe_allow_html=True,
             )
-            fig.update_xaxes(type="category")
+
+            st.markdown("### Ranking territorial no ano selecionado")
+
+            rank = ref.sort_values("taxa_10000", ascending=False).head(limite_ranking).copy()
+            rank_plot = rank.sort_values("taxa_10000", ascending=True)
+
+            fig = px.bar(
+                rank_plot,
+                x="taxa_10000",
+                y="territorio",
+                orientation="h",
+                text="taxa_10000",
+                hover_data={
+                    "vinculos": ":,.0f",
+                    "populacao": ":,.0f",
+                    "taxa_10000": ":.2f",
+                },
+                title=(
+                    f"Maiores densidades — {CATEGORIA_SB_NOMES.get(categoria_territorio, categoria_territorio)}, "
+                    f"{ano_territorio}"
+                ),
+                labels={
+                    "taxa_10000": "Vínculos por 10 mil habitantes",
+                    "territorio": "",
+                },
+            )
+            fig.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+            fig.update_layout(height=max(520, 24 * len(rank_plot) + 180), showlegend=False)
             plot(fig)
 
-        ultimo = max(selected_years)
-        top_region = region[region["ano"] == ultimo].sort_values("taxa_regional", ascending=False).head(max_categories)
-        fig = px.bar(
-            top_region.sort_values("taxa_regional"),
-            x="taxa_regional",
-            y="regiao_de_saude",
-            color="sg_uf",
-            orientation="h",
-            title=f"Regiões de saúde com maiores taxas — {ultimo}",
-            labels={"taxa_regional": tax_label, "regiao_de_saude": ""},
-        )
-        plot(fig)
+            st.markdown("### Mapas coropléticos da distribuição espacial")
 
-        if show_raw_tables:
-            st.markdown("#### Regiões de saúde")
-            show_table(friendly_columns(region), height=360)
-            st.markdown("#### Macrorregiões de saúde")
-            show_table(friendly_columns(macro), height=360)
+            mc1, mc2, mc3 = st.columns([1.0, 1.0, 1.0])
+
+            with mc1:
+                mapa_nivel = st.selectbox(
+                    "Nível do mapa",
+                    ["UF", "Município"],
+                    index=0,
+                    help="O mapa municipal pode ficar pesado se muitas UFs estiverem selecionadas.",
+                )
+
+            with mc2:
+                mapa_metrica = st.selectbox(
+                    "Métrica do mapa",
+                    ["Vínculos por 10 mil hab.", "Vínculos absolutos"],
+                    index=0,
+                )
+
+            with mc3:
+                mapa_escala = st.selectbox(
+                    "Escala do mapa",
+                    ["Linear", "Logarítmica (transformada)"],
+                    index=0,
+                )
+
+            map_df = build_territory_summary(mapa_nivel, categoria_territorio)
+            map_df = map_df[map_df["ano"] == ano_territorio].copy()
+
+            if mapa_metrica == "Vínculos absolutos":
+                map_df["valor_mapa"] = map_df["vinculos"]
+                legenda = "Vínculos"
+            else:
+                map_df["valor_mapa"] = map_df["taxa_10000"]
+                legenda = "Vínculos por 10 mil hab."
+
+            if mapa_escala.startswith("Log"):
+                map_df["valor_mapa_plot"] = map_df["valor_mapa"].fillna(0).apply(lambda x: 0 if x <= 0 else __import__("math").log10(x + 1))
+                legenda_plot = f"log10({legenda} + 1)"
+            else:
+                map_df["valor_mapa_plot"] = map_df["valor_mapa"]
+                legenda_plot = legenda
+
+            if mapa_nivel == "UF":
+                geojson_obj, geo_src = load_geojson("uf")
+                loc_col = "sg_uf"
+                top_cols = ["territorio", "vinculos", "populacao", "taxa_10000"]
+            else:
+                geojson_obj, geo_src = load_geojson("municipio")
+                loc_col = "cod_municipio"
+                top_cols = ["territorio", "sg_uf", "vinculos", "populacao", "taxa_10000"]
+
+            if geojson_obj is None:
+                st.warning(
+                    "GeoJSON não encontrado. Confira se existem assets/br_ufs.geojson e "
+                    "assets/br_municipios.geojson na pasta do projeto."
+                )
+            else:
+                feature_ids = {
+                    str(feat.get("properties", {}).get("match_id", ""))
+                    for feat in geojson_obj.get("features", [])
+                }
+                loc_values = set(map_df[loc_col].dropna().astype(str).tolist())
+                matched_values = loc_values.intersection(feature_ids)
+
+                st.caption(
+                    f"Base cartográfica: {geo_src} | "
+                    f"feições: {len(feature_ids):,} | "
+                    f"territórios no painel: {len(loc_values):,} | "
+                    f"territórios encontrados no mapa: {len(matched_values):,}"
+                )
+
+                if len(matched_values) == 0:
+                    st.error(
+                        "Os arquivos cartográficos foram localizados, mas nenhum código territorial do painel "
+                        "casou com o GeoJSON."
+                    )
+                else:
+                    st.caption("Mapa redesenhado com polígonos Plotly, sem dependência de matplotlib.")
+
+                    fig_map = make_polygon_choropleth(
+                        geojson_obj,
+                        map_df,
+                        loc_col=loc_col,
+                        value_col="valor_mapa_plot",
+                        title=(
+                            f"Distribuição espacial — {CATEGORIA_SB_NOMES.get(categoria_territorio, categoria_territorio)}, "
+                            f"{ano_territorio}"
+                        ),
+                        legend_label=legenda_plot,
+                        max_ring_points=500 if mapa_nivel == "Município" else 1200,
+                    )
+
+                    if fig_map is None:
+                        st.error("Não foi possível desenhar o mapa com os territórios encontrados.")
+                    else:
+                        plot(fig_map)
+
+                c_map1, c_map2 = st.columns([1.1, 0.9])
+                with c_map1:
+                    map_rank = map_df.sort_values("valor_mapa", ascending=False)[top_cols + ["valor_mapa"]].head(20).copy()
+                    rename_cols = {
+                        "territorio": "Território",
+                        "sg_uf": "UF",
+                        "vinculos": "Vínculos",
+                        "populacao": "População",
+                        "taxa_10000": "Vínculos por 10 mil hab.",
+                        "valor_mapa": legenda,
+                    }
+                    map_rank = map_rank.rename(columns=rename_cols)
+                    show_cols = [c for c in ["Território", "UF", legenda, "Vínculos", "População", "Vínculos por 10 mil hab."] if c in map_rank.columns]
+                    show_table(map_rank[show_cols], height=360)
+
+                with c_map2:
+                    fig = px.scatter(
+                        ref,
+                        x="populacao",
+                        y="taxa_10000",
+                        size=ref["vinculos"].clip(lower=1),
+                        hover_name="territorio",
+                        hover_data={
+                            "vinculos": ":,.0f",
+                            "populacao": ":,.0f",
+                            "taxa_10000": ":.2f",
+                        },
+                        title=f"População × densidade — {ano_territorio}",
+                        labels={
+                            "populacao": "População",
+                            "taxa_10000": "Vínculos por 10 mil hab.",
+                        },
+                    )
+                    fig.update_xaxes(type="log")
+                    fig.update_layout(height=360)
+                    plot(fig)
+
+            st.markdown("### Tabela territorial")
+
+            table = ref.sort_values("taxa_10000", ascending=False).copy()
+            table_out = table.rename(
+                columns={
+                    "ano": "Ano",
+                    "territorio": "Território",
+                    "vinculos": "Vínculos",
+                    "populacao": "População",
+                    "taxa_10000": "Vínculos por 10 mil hab.",
+                    "nivel_territorial": "Nível territorial",
+                    "categoria": "Categoria",
+                    "sg_uf": "UF",
+                    "regiao_de_saude": "Região de saúde",
+                    "macrorregiao_de_saude": "Macrorregião de saúde",
+                    "cod_municipio": "Código município",
+                    "municipio_label": "Município",
+                }
+            )
+
+            cols_show = [
+                "Ano",
+                "Nível territorial",
+                "Categoria",
+                "UF",
+                "Território",
+                "Vínculos",
+                "População",
+                "Vínculos por 10 mil hab.",
+            ]
+            cols_show = [c for c in cols_show if c in table_out.columns]
+            show_table(table_out[cols_show], height=420)
+
             download_buttons(
-                friendly_columns(region),
-                "territorio_regioes_macros",
-                {"regioes": friendly_columns(region), "macrorregioes": friendly_columns(macro)},
+                table_out,
+                "territorio_mapas_densidades_saude_bucal",
+                {
+                    "ano_selecionado": table_out,
+                    "serie_completa": terr_df.rename(
+                        columns={
+                            "ano": "Ano",
+                            "territorio": "Território",
+                            "vinculos": "Vínculos",
+                            "populacao": "População",
+                            "taxa_10000": "Vínculos por 10 mil hab.",
+                            "nivel_territorial": "Nível territorial",
+                            "categoria": "Categoria",
+                        }
+                    ),
+                    "mapa_ano": map_df.rename(
+                        columns={
+                            "ano": "Ano",
+                            "territorio": "Território",
+                            "vinculos": "Vínculos",
+                            "populacao": "População",
+                            "taxa_10000": "Vínculos por 10 mil hab.",
+                            "valor_mapa": legenda,
+                        }
+                    ),
+                },
             )
+
 
 
 with tabs[3]:
@@ -2466,7 +3122,7 @@ with tabs[7]:
     export_tables["colunas_banco"] = pd.DataFrame({"Coluna original": cols})
 
     show_table(export_tables["serie_temporal"])
-    download_buttons(export_tables["serie_temporal"], "exportacao_geral_v5_7_saude_bucal_2", export_tables)
+    download_buttons(export_tables["serie_temporal"], "exportacao_geral_v6_5_saude_bucal_2", export_tables)
 
     if "diagnostico_integracao_municipal" in export_tables:
         st.markdown("### Diagnóstico da integração município-população")
@@ -2492,6 +3148,7 @@ with tabs[7]:
 
 
 st.markdown(
-    '<div class="ow-footer">OdontoWorkforce Brasil V5.7 Saúde Bucal — painel experimental para análise de força de trabalho odontológica com RAIS, regiões de saúde e populações IBGE/TCU.</div>',
+    '<div class="ow-footer">OdontoWorkforce Brasil V6.5 Saúde Bucal — painel experimental para análise de força de trabalho odontológica com RAIS, regiões de saúde e populações IBGE/TCU.</div>',
     unsafe_allow_html=True,
 )
+
