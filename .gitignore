@@ -3,3 +3,5 @@
 .venv/
 .env
 .streamlit/secrets.toml
+
+_backup_dashboards_antigos/
